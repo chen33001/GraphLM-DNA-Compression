@@ -151,6 +151,8 @@ activemq-data/
 .env
 .envrc
 .venv
+.uv-cache/
+.hf-cache/
 env/
 venv/
 ENV/
@@ -216,3 +218,18 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# third-party notices
+THIRD_PARTY_NOTICES.md
+
+# docs
+docs/
+
+# results
+results/
+
+# model
+model/
+
+# codegraph
+.codegraph
