@@ -156,7 +156,7 @@ Latest reported results:
 | `graph_plus_dnagpt2` | 1380 | 11.04 | 54.08 | 54.17 |
 | `gzip -9` | 115 | 0.92 | 0.0001 | 0.0001 |
 
-Diagnostics for the selected top-level archive:
+Diagnostics for the selected top-level archive (`adaptive_dnagpt2_hybrid` behavior):
 
 - `selected_candidate = pruned_graph`
 - `graph_copy_bases = 353`
@@ -185,7 +185,7 @@ Latest reported results:
 | `graph_plus_dnagpt2` | 1884 | 6.03 | 33.06 | 32.97 |
 | `gzip -9` | 229 | 0.73 | 0.0002 | 0.0001 |
 
-Diagnostics for the selected top-level archive:
+Diagnostics for the selected top-level archive (`adaptive_dnagpt2_hybrid` behavior):
 
 - `selected_candidate = no_graph`
 - `graph_copy_bases = 0`
@@ -198,6 +198,7 @@ Interpretation:
 - `graph_only` is extremely fast but compresses worse than the DNAGPT2-based methods.
 - `dnagpt2_only` gives the best compression ratio among the reported methods, but is expensive in time.
 - `graph_plus_dnagpt2` is much faster than `dnagpt2_only` on this input, but it loses a lot in `bpb`.
+- In the forced-graph ablation, `selected_candidate = force_graph`, `graph_copy_bases = 1946`, and `raw_residual_blocks = 7`.
 - On `2500bp`, forcing graph copies improves runtime substantially, but not enough to justify the compression-ratio loss.
 
 ### `5000bp`
@@ -215,7 +216,7 @@ Latest reported results:
 | `graph_plus_dnagpt2` | 2425 | 3.88 | 168.29 | 168.47 |
 | `gzip -9` | 880 | 1.41 | 0.0004 | 0.0001 |
 
-Diagnostics for the selected top-level archive:
+Diagnostics for the selected top-level archive (`adaptive_dnagpt2_hybrid` behavior):
 
 - `selected_candidate = no_graph`
 - `graph_copy_bases = 0`
@@ -227,6 +228,7 @@ Interpretation:
 
 - `dnagpt2_only` again gives the best compression ratio among the project methods.
 - `graph_plus_dnagpt2` is much faster than `dnagpt2_only` on this longer input.
+- In the forced-graph ablation, `selected_candidate = force_graph`, `graph_copy_bases = 2642`, and `raw_residual_blocks = 6`.
 - The forced graph path still compresses worse than `dnagpt2_only`, but the runtime gap is now large enough to show a real speed/compression tradeoff.
 
 ### Current conclusion
