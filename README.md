@@ -168,7 +168,7 @@ Interpretation:
 
 - `graph_plus_dnagpt2` is currently worse than `dnagpt2_only` in `bpb` on this input.
 - It is faster than `dnagpt2_only`, but still much slower than `graph_only`.
-- On this window, the hybrid graph stage is not yet justified by compression ratio.
+- On this window, the planner still keeps some graph structure, but that graph-assisted layout does not improve compression ratio.
 
 ### `2500bp`
 
@@ -199,7 +199,7 @@ Interpretation:
 - `dnagpt2_only` gives the best compression ratio among the reported methods, but is expensive in time.
 - `graph_plus_dnagpt2` is much faster than `dnagpt2_only` on this input, but it loses a lot in `bpb`.
 - In the forced-graph ablation, `selected_candidate = force_graph`, `graph_copy_bases = 1946`, and `raw_residual_blocks = 7`.
-- On `2500bp`, forcing graph copies improves runtime substantially, but not enough to justify the compression-ratio loss.
+- On `2500bp`, the planner rejects graph use for the final archive, while the forced-graph ablation shows a clear speed gain but a clear compression loss.
 
 ### `5000bp`
 
@@ -229,15 +229,15 @@ Interpretation:
 - `dnagpt2_only` again gives the best compression ratio among the project methods.
 - `graph_plus_dnagpt2` is much faster than `dnagpt2_only` on this longer input.
 - In the forced-graph ablation, `selected_candidate = force_graph`, `graph_copy_bases = 2642`, and `raw_residual_blocks = 6`.
-- The forced graph path still compresses worse than `dnagpt2_only`, but the runtime gap is now large enough to show a real speed/compression tradeoff.
+- The planner again rejects graph use for the final archive, but the forced-graph ablation shows a large runtime reduction at the cost of noticeably worse compression.
 
 ### Current conclusion
 
 - At the moment, the hybrid method should still be treated as experimental.
-- The `1000bp` result shows a real graph-assisted hybrid layout, but it is still worse than `dnagpt2_only` in `bpb`.
-- The planner-based top-level archive still selects `no_graph` on both `2500bp` and `5000bp`.
-- The forced `graph_plus_dnagpt2` ablation is now clearly measurable: it is substantially faster than `dnagpt2_only` on `2500bp` and `5000bp`, but it still loses on compression ratio.
-- The current evidence suggests the graph stage is acting more like a speed/structure tradeoff than a direct compression win when combined with DNAGPT2.
+- The `1000bp` result shows that a graph-assisted layout can be selected, but it still does not beat `dnagpt2_only` on compression ratio.
+- On `2500bp` and `5000bp`, the planner-based archive selects `no_graph`, which means the current adaptive strategy does not see graph preprocessing as worthwhile on those inputs.
+- The forced `graph_plus_dnagpt2` ablation is still useful experimentally because it shows a consistent pattern: graph copies can reduce DNAGPT2 runtime a lot, but they currently make the final archive larger.
+- The current evidence supports a narrower claim than the original idea: graph repeats are presently acting as a speed tradeoff for DNAGPT2 residual coding, not as a compression-ratio improvement.
 
 ## DNAGPT2 model source
 
