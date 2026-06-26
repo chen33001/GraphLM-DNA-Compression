@@ -1,6 +1,78 @@
 # GraphLM-DNA-Compression
 
-Graph-theoretic and language-model-based DNA compression with benchmarking of compression ratio and decompression performance.
+## Goal of this project
+
+GraphLM-DNA-Compression is a lossless DNA compression prototype for studying whether graph-based repeat detection and language-model-based residual coding can improve genomic compression.
+
+The current project focuses on:
+
+- using de Bruijn graph structure to find repeated regions in DNA sequences;
+- using DNAGPT2-guided arithmetic coding for non-repeated residual regions;
+- benchmarking `graph_only`, `dnagpt2_only`, and `graph_plus_dnagpt2` against `gzip -9`.
+
+## Architecture
+
+The current compression pipeline is:
+
+1. Read one FASTA record.
+2. Build a de Bruijn graph from the sequence.
+3. Find repeated regions using graph-seeded repeat discovery.
+4. Split the sequence into an ordered stream of block types:
+   - `graph_copy`
+   - `llm_residual`
+   - `raw_residual`
+5. Write a versioned archive and verify exact round-trip restoration.
+
+### Where graph theory is used
+
+Graph theory is used to find repeated sequence regions, not to serialize the graph itself.
+
+- A de Bruijn graph is built from the DNA sequence.
+- The repeat finder uses `k`-mer overlap structure and prior positions to locate greedy non-overlapping repeated regions.
+- Each repeated region is encoded as a `graph_copy` back-reference:
+  - `start`
+  - `source`
+  - `length`
+
+So the graph stage acts like a repeat-copy detector over genomic sequence.
+
+### How DNAGPT2 is used
+
+DNAGPT2 is used only on residual sequence that is not covered by `graph_copy` blocks.
+
+- The residual DNA substring is tokenized.
+- DNAGPT2 provides next-token probabilities.
+- Those probabilities are converted into integer CDFs.
+- Arithmetic coding compresses the token stream into the final residual payload.
+
+This means:
+
+- graph stage: finds what can be copied;
+- DNAGPT2 stage: compresses what cannot be copied;
+- raw residual stage: stores short fallback fragments directly.
+
+### Raw residual fallback
+
+`raw_residual` blocks are now stored with strict 2-bit packing for `A/C/G/T`.
+
+- `A/C/G/T` only
+- `2 bits/base`
+- no `N` fallback in the raw residual path
+
+This matches the intended cleaned-data workflow for current benchmarks.
+
+### Compression modes
+
+The benchmark and implementation currently expose three important modes:
+
+- `graph_only`
+  - graph-copy compression plus plain residual storage
+- `dnagpt2_only` (`dnagpt2_residual_only` in code/results)
+  - DNAGPT2-guided arithmetic coding without graph repeats
+- `graph_plus_dnagpt2`
+  - forced graph-copy compression plus DNAGPT2 residual coding
+- `adaptive_dnagpt2_hybrid`
+  - planner-based graph-copy plus DNAGPT2 hybrid that may still choose `no_graph`
 
 ## Development setup
 
@@ -45,14 +117,15 @@ results/
 `- chm13_chr1_500bp.benchmark.txt
 ```
 
-The benchmark measures archive size, bits per base, compression time, and decompression time for both GHDNA and `gzip -9`. gzip decompression is verified against the original FASTA bytes. Timings are single-run wall-clock measurements and can vary between runs.
+The benchmark measures:
 
-The `visualize-graph` command writes a Mermaid markdown file to `outputs/` by default:
+- archive size
+- bits per base
+- compression time
+- decompression time
+- diagnostic fields for the current `GHDNA_2` planner
 
-```text
-outputs/
-`- chm13_chr1_500bp.debruijn.md
-```
+It always compares against `gzip -9`, which is used as a standard "best effort gzip" baseline.
 
 Choose another output directory when needed:
 
@@ -60,67 +133,114 @@ Choose another output directory when needed:
 uv run python main.py benchmark examples/chm13_chr1_500bp.fa --results-dir path/to/results --k 15 --min-repeat-len 40
 ```
 
-When benchmarking the DNAGPT2 path, you can request additional ablation runs in the same report:
+When benchmarking the DNAGPT2 path, request the ablation variants explicitly:
 
 ```bash
-uv run python main.py benchmark examples/chm13_chr1_500bp.fa --archive-version 2 --residual-codec dnagpt2 --device cpu --k 15 --min-repeat-len 40 --benchmark-variant graph_only --benchmark-variant dnagpt2_residual_only --benchmark-variant graph_plus_dnagpt2
+uv run python main.py benchmark examples/chm13_chr1_2500bp.fa --results-dir results --archive-version 2 --residual-codec dnagpt2 --device cpu --k 15 --min-repeat-len 40 --benchmark-variant graph_only --benchmark-variant dnagpt2_residual_only --benchmark-variant graph_plus_dnagpt2
 ```
 
-## Genomic benchmark examples
+## Benchmark results
 
-The current `examples/` directory contains:
+### `1000bp`
 
-| File | Reference window | Purpose |
-|---|---|---|
-| `chm13_chr1_500bp.fa` | T2T-CHM13v2.0 chr1, first 500 bp | Small reproducible smoke-test input |
-| `chm13v2.0.fa` | T2T-CHM13v2.0 source FASTA | Large human source FASTA for extracting windows |
-| `Arabidopsis_Chr1.fa` | TAIR10 chr1 source FASTA | Large plant source FASTA for extracting windows |
+- sequence file: `examples/chm13_chr1_1000bp.fa`
+- sequence length: `1000 bp`
+- original FASTA size: `1052 bytes`
 
-Run them with:
+Latest reported results:
 
-```bash
-uv run python main.py benchmark examples/chm13_chr1_500bp.fa --k 15 --min-repeat-len 40
-uv run python main.py visualize-graph examples/chm13_chr1_500bp.fa --k 15 --max-edges 50
-```
+| Method | Size (bytes) | bpb | Compress (s) | Decompress (s) |
+|---|---:|---:|---:|---:|
+| `graph_only` | 1298 | 10.38 | 0.0049 | 0.0008 |
+| `dnagpt2_only` | 1294 | 10.35 | 73.25 | 73.03 |
+| `graph_plus_dnagpt2` | 1380 | 11.04 | 54.08 | 54.17 |
+| `gzip -9` | 115 | 0.92 | 0.0001 | 0.0001 |
 
-For larger experiments, extract a bounded window from `chm13v2.0.fa` or `Arabidopsis_Chr1.fa` first instead of benchmarking the full source FASTA directly.
+Diagnostics for the selected top-level archive:
 
-```bash
-uv run python main.py benchmark examples/chm13_chr1_500bp.fa --archive-version 2 --residual-codec dnagpt2 --device cpu --k 15 --min-repeat-len 40
-```
+- `selected_candidate = pruned_graph`
+- `graph_copy_bases = 353`
+- `residual_bases = 647`
+- `llm_residual_blocks = 2`
+- `raw_residual_blocks = 0`
 
-The current small example is normalized to uppercase `A/C/G/T/N` FASTA and is intended for fast validation before moving to larger extracted windows.
+Interpretation:
 
-## Experimental hybrid DNAGPT2 mode
+- `graph_plus_dnagpt2` is currently worse than `dnagpt2_only` in `bpb` on this input.
+- It is faster than `dnagpt2_only`, but still much slower than `graph_only`.
+- On this window, the hybrid graph stage is not yet justified by compression ratio.
 
-The default path remains `GHDNA_1`, a readable JSON archive with Markov-scored residual blocks. An experimental `GHDNA_2` path stores residual payloads out of line and can use either a plain residual codec or a pinned DNAGPT2-backed arithmetic codec.
+### `2500bp`
 
-```bash
-uv run python main.py compress examples/chm13_chr1_500bp.fa hybrid.ghdna --archive-version 2 --residual-codec dnagpt2 --device cpu --k 15 --min-repeat-len 40
-uv run python main.py decompress hybrid.ghdna hybrid.restored.fa --residual-codec dnagpt2 --device cpu
-uv run python main.py benchmark examples/chm13_chr1_500bp.fa --archive-version 2 --residual-codec dnagpt2 --device cpu --k 15 --min-repeat-len 40
-```
+- sequence file: `examples/chm13_chr1_2500bp.fa`
+- sequence length: `2500 bp`
+- original FASTA size: `2590 bytes`
 
-The current DNAGPT2 backend already loads the trained `vojtam/DNAGPT2_32` checkpoint by default, pinned to revision `cc28f01babc5271d96c65499682868e1fe40baaa`. When a complete local `model/` directory is present (`config.json`, `model.safetensors`, `tokenizer.json`), the backend prefers that local copy automatically before checking Hugging Face cache or the remote repository. Decompression requires an explicit `--residual-codec dnagpt2` selection for that path; the decoder does not auto-load external model weights from archive metadata.
+Latest reported results:
 
-DNAGPT2 runtime parameters are configurable from the CLI when needed:
+| Method | Size (bytes) | bpb | Compress (s) | Decompress (s) |
+|---|---:|---:|---:|---:|
+| `graph_only` | 1971 | 6.31 | 0.0480 | 0.0014 |
+| `dnagpt2_only` | 1397 | 4.47 | 358.80 | 361.04 |
+| `graph_plus_dnagpt2` | 1884 | 6.03 | 33.06 | 32.97 |
+| `gzip -9` | 229 | 0.73 | 0.0002 | 0.0001 |
 
-```bash
-uv run python main.py compress examples/chm13_chr1_500bp.fa --archive-version 2 --residual-codec dnagpt2 --model-repository vojtam/DNAGPT2_32 --model-revision cc28f01babc5271d96c65499682868e1fe40baaa --context-length 1024 --stride 512 --cdf-scale 32768 --state-bits 64
-```
+Diagnostics for the selected top-level archive:
 
-`GHDNA_2` is functionally lossless but still experimental. The current implementation resets LLM context per residual block, splits long residuals into context-safe chunks, and uses exact stepwise probability generation for correctness.
+- `selected_candidate = no_graph`
+- `graph_copy_bases = 0`
+- `residual_bases = 2500`
+- `llm_residual_blocks = 2`
+- `raw_residual_blocks = 0`
 
-## Complexity analysis
+Interpretation:
 
-The notebook-style complexity analysis has been split into a reusable module at `src/complexity_analysis.py`. It currently exposes:
+- `graph_only` is extremely fast but compresses worse than the DNAGPT2-based methods.
+- `dnagpt2_only` gives the best compression ratio among the reported methods, but is expensive in time.
+- `graph_plus_dnagpt2` is much faster than `dnagpt2_only` on this input, but it loses a lot in `bpb`.
+- On `2500bp`, forcing graph copies improves runtime substantially, but not enough to justify the compression-ratio loss.
 
-- Shannon entropy in bits per base
-- LZ76-style complexity
-- GC fraction and length summaries
+### `5000bp`
 
-This is intended for analysis workflows and benchmark interpretation rather than archive production.
+- sequence file: `examples/chm13_chr1_5000bp.fa`
+- sequence length: `5000 bp`
+- original FASTA size: `5152 bytes`
 
-Re-running a benchmark for the same input filename overwrites that input's existing result artifacts.
+Latest reported results:
 
-See [the project specification](docs/PROJECT_SPECIFICATION.md), [implementation log](docs/IMPLEMENTATION_LOG.md), and [third-party notices](THIRD_PARTY_NOTICES.md) for architecture, verification, and Apache-2.0 attribution details.
+| Method | Size (bytes) | bpb | Compress (s) | Decompress (s) |
+|---|---:|---:|---:|---:|
+| `graph_only` | 3951 | 6.32 | 0.0347 | 0.0009 |
+| `dnagpt2_only` | 1808 | 2.89 | 973.40 | 973.14 |
+| `graph_plus_dnagpt2` | 2425 | 3.88 | 168.29 | 168.47 |
+| `gzip -9` | 880 | 1.41 | 0.0004 | 0.0001 |
+
+Diagnostics for the selected top-level archive:
+
+- `selected_candidate = no_graph`
+- `graph_copy_bases = 0`
+- `residual_bases = 5000`
+- `llm_residual_blocks = 3`
+- `raw_residual_blocks = 0`
+
+Interpretation:
+
+- `dnagpt2_only` again gives the best compression ratio among the project methods.
+- `graph_plus_dnagpt2` is much faster than `dnagpt2_only` on this longer input.
+- The forced graph path still compresses worse than `dnagpt2_only`, but the runtime gap is now large enough to show a real speed/compression tradeoff.
+
+### Current conclusion
+
+- At the moment, the hybrid method should still be treated as experimental.
+- The `1000bp` result shows a real graph-assisted hybrid layout, but it is still worse than `dnagpt2_only` in `bpb`.
+- The planner-based top-level archive still selects `no_graph` on both `2500bp` and `5000bp`.
+- The forced `graph_plus_dnagpt2` ablation is now clearly measurable: it is substantially faster than `dnagpt2_only` on `2500bp` and `5000bp`, but it still loses on compression ratio.
+- The current evidence suggests the graph stage is acting more like a speed/structure tradeoff than a direct compression win when combined with DNAGPT2.
+
+## DNAGPT2 model source
+
+The DNAGPT2 backend used in this project is based on the `vojtam/DNAGPT2_32` model, pinned in the current implementation to revision:
+
+`cc28f01babc5271d96c65499682868e1fe40baaa`
+
+When a complete local `model/` directory is present (`config.json`, `model.safetensors`, `tokenizer.json`), the backend prefers that local copy automatically before checking Hugging Face cache or the remote repository.
