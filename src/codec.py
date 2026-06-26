@@ -1,6 +1,7 @@
 """GraphLM-HDNA compression and decompression pipeline."""
 
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from src.archive import MAGIC, read_archive, write_archive
@@ -15,6 +16,9 @@ from src.utils import sequence_checksum
 _MIN_LLM_RESIDUAL_BASES = 64
 _MAX_HYBRID_RESIDUAL_BLOCKS = 8
 _MAX_HYBRID_RESIDUAL_FRACTION = 0.2
+_ESTIMATED_LLM_BITS_PER_TOKEN = 2.0
+_DNA_2BIT_ENCODE = {"A": 0, "C": 1, "G": 2, "T": 3}
+_DNA_2BIT_DECODE = "ACGT"
 
 
 def compress_fasta(
@@ -27,6 +31,7 @@ def compress_fasta(
     archive_version: int = 1,
     residual_codec: ResidualCodec | None = None,
     use_graph_repeats: bool = True,
+    hybrid_graph_policy: str = "auto",
 ) -> dict[str, Any]:
     record = read_fasta(input_path)
     graph = build_debruijn_graph(record.sequence, k) if len(record.sequence) > k else {}
@@ -41,6 +46,7 @@ def compress_fasta(
             output_path,
             repeats,
             residual_codec or PlainResidualCodec(),
+            hybrid_graph_policy=hybrid_graph_policy,
             k=k,
             min_repeat_len=min_repeat_len,
             lm_order=lm_order,
@@ -118,10 +124,35 @@ def _compress_v2(
     output_path: str | Path,
     repeats: list[dict[str, int]],
     residual_codec: ResidualCodec,
+    hybrid_graph_policy: str = "auto",
     **parameters: int,
 ) -> dict[str, Any]:
-    repeats = _select_v2_repeats(record.sequence, repeats, residual_codec)
-    blocks, payload = _build_v2_blocks(record.sequence, repeats, residual_codec)
+    planning_started = perf_counter()
+    if hybrid_graph_policy == "auto":
+        selected_repeats, planning_diagnostics = _select_v2_repeats(
+            record.sequence,
+            repeats,
+            residual_codec,
+        )
+    elif hybrid_graph_policy == "force_graph":
+        selected_repeats = repeats
+        planning_diagnostics = {
+            "candidate_count": 1,
+            "selected_candidate": "force_graph",
+            "selected_estimated_bytes": 0,
+        }
+    else:
+        raise ValueError("hybrid_graph_policy must be 'auto' or 'force_graph'")
+    planning_time = perf_counter() - planning_started
+    blocks, payload = _build_v2_blocks(record.sequence, selected_repeats, residual_codec)
+    diagnostics = _build_v2_diagnostics(
+        record.sequence,
+        selected_repeats,
+        blocks,
+        payload,
+        planning_time,
+        planning_diagnostics,
+    )
 
     metadata = {
         "magic": "GHDNA_2",
@@ -130,6 +161,7 @@ def _compress_v2(
         "sha256": sequence_checksum(record.sequence),
         "parameters": {
             **parameters,
+            "hybrid_graph_policy": hybrid_graph_policy,
             "min_llm_residual_bases": _MIN_LLM_RESIDUAL_BASES,
             "max_hybrid_residual_blocks": _MAX_HYBRID_RESIDUAL_BLOCKS,
             "max_hybrid_residual_fraction": _MAX_HYBRID_RESIDUAL_FRACTION,
@@ -137,6 +169,7 @@ def _compress_v2(
         "residual_codec": residual_codec.codec_id,
         "residual_codec_metadata": residual_codec.archive_metadata(),
         "blocks": blocks,
+        "diagnostics": diagnostics,
     }
     write_binary_archive(BinaryArchive(metadata=metadata, payload=payload, blocks=blocks), output_path)
     return metadata
@@ -169,6 +202,11 @@ def _decompress_v2(
             end = offset + payload_length
             if offset < 0 or payload_length < 0 or end > len(archive.payload):
                 raise ValueError("invalid residual payload range")
+            context = ""
+            if block.get("use_context"):
+                context_window = _context_window(codec)
+                if context_window > 0:
+                    context = sequence[max(0, len(sequence) - context_window) :]
             encoded = EncodedResidual(
                 payload=archive.payload[offset:end],
                 bit_length=block["bit_length"],
@@ -178,7 +216,7 @@ def _decompress_v2(
                     {"use_context": bool(block.get("use_context"))},
                 ),
             )
-            residual = codec.decode_with_context(encoded, sequence)
+            residual = codec.decode_with_context(encoded, context)
             if len(residual) != block["length"]:
                 raise ValueError(
                     "decoded residual length mismatch "
@@ -192,7 +230,7 @@ def _decompress_v2(
             end = offset + payload_length
             if offset < 0 or payload_length < 0 or end > len(archive.payload):
                 raise ValueError("invalid raw residual payload range")
-            residual = archive.payload[offset:end].decode("ascii")
+            residual = _unpack_dna_2bit(archive.payload[offset:end], block["length"])
             if len(residual) != block["length"]:
                 raise ValueError("decoded raw residual length mismatch")
             sequence += residual
@@ -221,7 +259,7 @@ def _build_v2_blocks(
         if not chunk:
             return
         offset = len(payload)
-        raw_payload = chunk.encode("ascii")
+        raw_payload = _pack_dna_2bit(chunk)
         payload.extend(raw_payload)
         blocks.append(
             {
@@ -250,19 +288,15 @@ def _build_v2_blocks(
         blocks.append(block)
 
     def append_residual(start: int, residual: str) -> None:
-        chunk_start = start
-        for chunk in residual_codec.split_sequence(residual):
-            if not chunk:
-                continue
-            if (
-                _uses_dnagpt2_residuals(residual_codec)
-                and len(chunk) < _MIN_LLM_RESIDUAL_BASES
-            ):
-                append_raw_residual(chunk_start, chunk)
+        for chunk_plan in _plan_residual_chunks(start, residual, sequence, residual_codec):
+            if chunk_plan["type"] == "raw_residual":
+                append_raw_residual(chunk_plan["start"], chunk_plan["sequence"])
             else:
-                context = sequence[max(0, chunk_start - _context_window(residual_codec)) : chunk_start]
-                append_llm_residual(chunk_start, chunk, context)
-            chunk_start += len(chunk)
+                append_llm_residual(
+                    chunk_plan["start"],
+                    chunk_plan["sequence"],
+                    chunk_plan["context"],
+                )
 
     for repeat in repeats:
         if repeat["start"] > cursor:
@@ -278,25 +312,47 @@ def _select_v2_repeats(
     sequence: str,
     repeats: list[dict[str, int]],
     residual_codec: ResidualCodec,
-) -> list[dict[str, int]]:
+) -> tuple[list[dict[str, int]], dict[str, Any]]:
     if not repeats or not _uses_dnagpt2_residuals(residual_codec):
-        return repeats
+        return repeats, {
+            "candidate_count": 1,
+            "selected_candidate": "original",
+            "selected_estimated_bytes": 0,
+        }
 
-    candidates = [
-        [],
-        _prune_repeats_for_hybrid(len(sequence), repeats, _MIN_LLM_RESIDUAL_BASES),
+    candidate_specs = [
+        ("no_graph", []),
+        (
+            "pruned_graph",
+            _prune_repeats_for_hybrid(len(sequence), repeats, _MIN_LLM_RESIDUAL_BASES),
+        ),
     ]
-    best_repeats = candidates[0]
-    best_size = None
-    for candidate in candidates:
-        blocks, payload = _build_v2_blocks(sequence, candidate, residual_codec)
-        if candidate and _hybrid_is_too_fragmented(len(sequence), blocks):
+    seen: set[tuple[tuple[int, int, int], ...]] = set()
+    candidates: list[tuple[str, list[dict[str, int]]]] = []
+    for name, candidate in candidate_specs:
+        key = tuple((item["start"], item["source"], item["length"]) for item in candidate)
+        if key in seen:
             continue
-        estimated_size = len(payload) + _estimated_block_table_size(blocks)
+        seen.add(key)
+        candidates.append((name, candidate))
+
+    best_name = candidates[0][0]
+    best_repeats = candidates[0][1]
+    best_size = None
+    for name, candidate in candidates:
+        plan_blocks = _plan_v2_blocks(sequence, candidate, residual_codec)
+        if candidate and _hybrid_is_too_fragmented(len(sequence), plan_blocks):
+            continue
+        estimated_size = _estimate_v2_plan_size(plan_blocks)
         if best_size is None or estimated_size < best_size:
             best_size = estimated_size
+            best_name = name
             best_repeats = candidate
-    return best_repeats
+    return best_repeats, {
+        "candidate_count": len(candidates),
+        "selected_candidate": best_name,
+        "selected_estimated_bytes": best_size or 0,
+    }
 
 
 def _prune_repeats_for_hybrid(
@@ -347,6 +403,131 @@ def _estimated_block_table_size(blocks: list[dict[str, Any]]) -> int:
     return size
 
 
+def _plan_v2_blocks(
+    sequence: str,
+    repeats: list[dict[str, int]],
+    residual_codec: ResidualCodec,
+) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    cursor = 0
+    for repeat in repeats:
+        if repeat["start"] > cursor:
+            blocks.extend(
+                _plan_residual_chunks(
+                    cursor,
+                    sequence[cursor : repeat["start"]],
+                    sequence,
+                    residual_codec,
+                )
+            )
+        blocks.append({"type": "graph_copy", **repeat})
+        cursor = repeat["start"] + repeat["length"]
+    if cursor < len(sequence):
+        blocks.extend(_plan_residual_chunks(cursor, sequence[cursor:], sequence, residual_codec))
+    return blocks
+
+
+def _plan_residual_chunks(
+    start: int,
+    residual: str,
+    sequence: str,
+    residual_codec: ResidualCodec,
+) -> list[dict[str, Any]]:
+    chunk_plans: list[dict[str, Any]] = []
+    chunk_start = start
+    context_window = _context_window(residual_codec)
+    for chunk in residual_codec.split_sequence(residual):
+        if not chunk:
+            continue
+        if _uses_dnagpt2_residuals(residual_codec) and len(chunk) < _MIN_LLM_RESIDUAL_BASES:
+            chunk_plans.append(
+                {
+                    "type": "raw_residual",
+                    "start": chunk_start,
+                    "length": len(chunk),
+                    "sequence": chunk,
+                }
+            )
+        else:
+            context = sequence[max(0, chunk_start - context_window) : chunk_start]
+            use_context = bool(
+                _uses_dnagpt2_residuals(residual_codec) and context and _llm_chunk_uses_context(
+                    residual_codec,
+                    chunk,
+                    context,
+                )
+            )
+            chunk_plans.append(
+                {
+                    "type": "llm_residual",
+                    "start": chunk_start,
+                    "length": len(chunk),
+                    "sequence": chunk,
+                    "context": context if use_context else "",
+                    "use_context": use_context,
+                }
+            )
+        chunk_start += len(chunk)
+    return chunk_plans
+
+
+def _estimate_v2_plan_size(blocks: list[dict[str, Any]]) -> int:
+    estimated_payload_bits = 0.0
+    compact_blocks: list[dict[str, Any]] = []
+    for block in blocks:
+        block_type = block["type"]
+        if block_type == "graph_copy":
+            compact_blocks.append(block)
+            continue
+        if block_type == "raw_residual":
+            estimated_payload_bits += len(block["sequence"]) * 2
+            compact_blocks.append(block)
+            continue
+        estimated_payload_bits += _estimate_llm_chunk_bits(block)
+        compact_blocks.append(block)
+    return int((estimated_payload_bits + 7) // 8) + _estimated_block_table_size(compact_blocks)
+
+
+def _estimate_llm_chunk_bits(block: dict[str, Any]) -> float:
+    token_count = block.get("estimated_symbol_count")
+    if token_count is None:
+        token_count = len(block["sequence"])
+    return max(1.0, float(token_count) * _ESTIMATED_LLM_BITS_PER_TOKEN)
+
+
+def _build_v2_diagnostics(
+    sequence: str,
+    repeats: list[dict[str, int]],
+    blocks: list[dict[str, Any]],
+    payload: bytes,
+    planning_time: float,
+    planning_diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    llm_blocks = [block for block in blocks if block["type"] == "llm_residual"]
+    raw_blocks = [block for block in blocks if block["type"] == "raw_residual"]
+    graph_blocks = [block for block in blocks if block["type"] == "graph_copy"]
+    llm_payload_bytes = sum(int(block["payload_length"]) for block in llm_blocks)
+    raw_payload_bytes = sum(int(block["payload_length"]) for block in raw_blocks)
+    graph_bases = sum(int(block["length"]) for block in graph_blocks)
+    residual_bases = sum(int(block["length"]) for block in llm_blocks + raw_blocks)
+    return {
+        "planning_time": planning_time,
+        "candidate_count": planning_diagnostics["candidate_count"],
+        "selected_candidate": planning_diagnostics["selected_candidate"],
+        "selected_estimated_bytes": planning_diagnostics["selected_estimated_bytes"],
+        "graph_copy_bases": graph_bases,
+        "graph_copy_fraction": graph_bases / len(sequence) if sequence else 0.0,
+        "residual_bases": residual_bases,
+        "llm_residual_blocks": len(llm_blocks),
+        "raw_residual_blocks": len(raw_blocks),
+        "context_residual_blocks": sum(bool(block.get("use_context")) for block in llm_blocks),
+        "llm_residual_payload_bytes": llm_payload_bytes,
+        "raw_residual_payload_bytes": raw_payload_bytes,
+        "payload_bytes": len(payload),
+        "selected_repeat_count": len(repeats),
+    }
+
+
 def _hybrid_is_too_fragmented(sequence_length: int, blocks: list[dict[str, Any]]) -> bool:
     residual_blocks = [
         block for block in blocks if block["type"] in {"llm_residual", "raw_residual"}
@@ -375,3 +556,51 @@ def _context_window(residual_codec: ResidualCodec) -> int:
 
 def _uses_dnagpt2_residuals(residual_codec: ResidualCodec) -> bool:
     return residual_codec.codec_id.startswith("dnagpt2")
+
+
+def _llm_chunk_uses_context(
+    residual_codec: ResidualCodec, sequence: str, context: str
+) -> bool:
+    tokenize_with_context = getattr(residual_codec, "_tokenize_with_context", None)
+    if tokenize_with_context is None:
+        return False
+    _, _, use_context = tokenize_with_context(sequence, context)
+    return bool(use_context)
+
+
+def _pack_dna_2bit(sequence: str) -> bytes:
+    invalid = set(sequence) - set(_DNA_2BIT_ENCODE)
+    if invalid:
+        raise ValueError(
+            "raw residual 2-bit packing supports only A/C/G/T, found: "
+            + "".join(sorted(invalid))
+        )
+    packed = bytearray()
+    accumulator = 0
+    bits_in_accumulator = 0
+    for base in sequence:
+        accumulator = (accumulator << 2) | _DNA_2BIT_ENCODE[base]
+        bits_in_accumulator += 2
+        if bits_in_accumulator == 8:
+            packed.append(accumulator)
+            accumulator = 0
+            bits_in_accumulator = 0
+    if bits_in_accumulator:
+        accumulator <<= 8 - bits_in_accumulator
+        packed.append(accumulator)
+    return bytes(packed)
+
+
+def _unpack_dna_2bit(payload: bytes, symbol_count: int) -> str:
+    if symbol_count < 0:
+        raise ValueError("raw residual symbol count must not be negative")
+    expected_length = (symbol_count + 3) // 4
+    if len(payload) != expected_length:
+        raise ValueError("raw residual payload length does not match symbol count")
+    bases: list[str] = []
+    for byte in payload:
+        for shift in (6, 4, 2, 0):
+            if len(bases) == symbol_count:
+                break
+            bases.append(_DNA_2BIT_DECODE[(byte >> shift) & 0b11])
+    return "".join(bases)

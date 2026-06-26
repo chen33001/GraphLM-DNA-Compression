@@ -81,7 +81,17 @@ class DNAGPT2ResidualCodec(ResidualCodec):
         max_tokens = int(self.backend.metadata.get("context_length", 0))
         if max_tokens <= 0:
             return [sequence]
-        if len(self.backend.tokenize(sequence)) <= max_tokens:
+        token_count_cache: dict[str, int] = {}
+
+        def token_count(fragment: str) -> int:
+            cached = token_count_cache.get(fragment)
+            if cached is not None:
+                return cached
+            cached = len(self.backend.tokenize(fragment))
+            token_count_cache[fragment] = cached
+            return cached
+
+        if token_count(sequence) <= max_tokens:
             return [sequence]
 
         chunks: list[str] = []
@@ -92,8 +102,8 @@ class DNAGPT2ResidualCodec(ResidualCodec):
             best_end = None
             while low <= high:
                 mid = (low + high) // 2
-                token_count = len(self.backend.tokenize(sequence[start:mid]))
-                if token_count <= max_tokens:
+                current_token_count = token_count(sequence[start:mid])
+                if current_token_count <= max_tokens:
                     best_end = mid
                     low = mid + 1
                 else:

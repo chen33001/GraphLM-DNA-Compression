@@ -5,7 +5,12 @@ import pytest
 
 from src.archive import read_archive, write_archive
 from src.archive_v2 import BINARY_MAGIC, read_binary_archive
-from src.codec import compress_fasta, decompress_ghdna
+from src.codec import (
+    _pack_dna_2bit,
+    _unpack_dna_2bit,
+    compress_fasta,
+    decompress_ghdna,
+)
 from src.fasta import read_fasta
 from src.residual_codec import EncodedResidual, ResidualCodec
 
@@ -121,3 +126,15 @@ def test_binary_v2_chunked_residual_codec_emits_multiple_contiguous_residual_blo
     assert [block["start"] for block in residuals] == [0, 4]
     assert [block["length"] for block in residuals] == [4, len(read_fasta(source).sequence) - 4]
     assert read_fasta(restored) == read_fasta(source)
+
+
+def test_raw_residual_uses_2bit_packing_for_acgt_only() -> None:
+    packed = _pack_dna_2bit("ACGTAC")
+
+    assert packed == bytes([0b00011011, 0b00010000])
+    assert _unpack_dna_2bit(packed, 6) == "ACGTAC"
+
+
+def test_raw_residual_2bit_packing_rejects_non_acgt_symbols() -> None:
+    with pytest.raises(ValueError, match="A/C/G/T"):
+        _pack_dna_2bit("ACGTN")

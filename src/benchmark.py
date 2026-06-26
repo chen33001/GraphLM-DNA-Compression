@@ -21,7 +21,8 @@ def _result_summary(
     decompression_time: float,
 ) -> dict[str, Any]:
     blocks = archive["blocks"]
-    return {
+    diagnostics = archive.get("diagnostics", {})
+    summary = {
         "compressed_size": compressed_size,
         "bits_per_base": compressed_size * 8 / sequence_length,
         "compression_time": compression_time,
@@ -32,6 +33,9 @@ def _result_summary(
         ),
         "raw_bits_per_base": original_size * 8 / sequence_length,
     }
+    if diagnostics:
+        summary.update(diagnostics)
+    return summary
 
 
 def benchmark_to_results(
@@ -179,6 +183,17 @@ def _benchmark_variants(
                     "archive_version": 2,
                     "residual_codec": residual_codec,
                     "use_graph_repeats": True,
+                    "hybrid_graph_policy": "force_graph",
+                }
+            )
+        elif variant == "adaptive_dnagpt2_hybrid":
+            _require_dnagpt2_codec(residual_codec)
+            variant_options.update(
+                {
+                    "archive_version": 2,
+                    "residual_codec": residual_codec,
+                    "use_graph_repeats": True,
+                    "hybrid_graph_policy": "auto",
                 }
             )
         else:
@@ -222,10 +237,31 @@ def format_benchmark(result: dict[str, Any]) -> str:
         f"{result['gzip_compression_time']:<13.6f} {result['gzip_decompression_time']:.6f}\n"
         f"raw FASTA     {result['original_size']:<13} {result['raw_bits_per_base']:<7.2f} -             -"
     )
+    diagnostics_lines: list[str] = []
+    if "planning_time" in result:
+        diagnostics_lines.extend(
+            [
+                "",
+                "Diagnostics",
+                (
+                    f"planning={result['planning_time']:.6f}s "
+                    f"candidate_count={result.get('candidate_count', 0)} "
+                    f"selected={result.get('selected_candidate', 'n/a')}"
+                ),
+                (
+                    f"graph_bases={result.get('graph_copy_bases', 0)} "
+                    f"residual_bases={result.get('residual_bases', 0)} "
+                    f"llm_blocks={result.get('llm_residual_blocks', 0)} "
+                    f"raw_blocks={result.get('raw_residual_blocks', 0)}"
+                ),
+            ]
+        )
     variants = result.get("variants", [])
     if not variants:
+        if diagnostics_lines:
+            return "\n".join([formatted, *diagnostics_lines])
         return formatted
-    lines = [formatted, "", "Variants", "Method                  Size(bytes)   bpb     Compress(s)   Decompress(s)"]
+    lines = [formatted, *diagnostics_lines, "", "Variants", "Method                  Size(bytes)   bpb     Compress(s)   Decompress(s)"]
     for variant in variants:
         lines.append(
             f"{variant['name']:<23} {variant['compressed_size']:<13} "

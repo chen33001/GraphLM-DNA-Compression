@@ -36,7 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument(
         "--benchmark-variant",
         action="append",
-        choices=("graph_only", "dnagpt2_residual_only", "graph_plus_dnagpt2"),
+        choices=(
+            "graph_only",
+            "dnagpt2_residual_only",
+            "graph_plus_dnagpt2",
+            "adaptive_dnagpt2_hybrid",
+        ),
         default=[],
         help="additional benchmark methods to run and report",
     )

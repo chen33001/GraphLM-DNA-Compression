@@ -83,6 +83,10 @@ def test_benchmark_counts_binary_v2_residual_blocks(tmp_path: Path) -> None:
 
     assert result["graph_copy_blocks"] == 1
     assert result["residual_blocks"] == 1
+    assert result["raw_residual_blocks"] == 0
+    assert result["graph_copy_bases"] > 0
+    assert result["planning_time"] >= 0
+    assert result["raw_residual_payload_bytes"] == 0
 
 
 def test_benchmark_reports_requested_variant_methods(tmp_path: Path) -> None:
@@ -97,14 +101,29 @@ def test_benchmark_reports_requested_variant_methods(tmp_path: Path) -> None:
         restored,
         archive_version=2,
         residual_codec=FakeBenchmarkDNAGPT2Codec(),
-        benchmark_variants=("graph_only", "dnagpt2_residual_only", "graph_plus_dnagpt2"),
+        benchmark_variants=(
+            "graph_only",
+            "dnagpt2_residual_only",
+            "graph_plus_dnagpt2",
+            "adaptive_dnagpt2_hybrid",
+        ),
         k=3,
         min_repeat_len=8,
     )
 
     names = [variant["name"] for variant in result["variants"]]
-    assert names == ["graph_only", "dnagpt2_residual_only", "graph_plus_dnagpt2"]
+    assert names == [
+        "graph_only",
+        "dnagpt2_residual_only",
+        "graph_plus_dnagpt2",
+        "adaptive_dnagpt2_hybrid",
+    ]
     assert all(variant["compressed_size"] > 0 for variant in result["variants"])
+    assert all("candidate_count" in variant for variant in result["variants"])
+    forced = next(variant for variant in result["variants"] if variant["name"] == "graph_plus_dnagpt2")
+    assert forced["selected_candidate"] == "force_graph"
+    adaptive = next(variant for variant in result["variants"] if variant["name"] == "adaptive_dnagpt2_hybrid")
+    assert adaptive["selected_candidate"] in {"pruned_graph", "no_graph", "original"}
 
 
 def test_cli_compresses_and_decompresses(tmp_path: Path) -> None:

@@ -1,4 +1,6 @@
 from src.llm_residual_codec import DNAGPT2ResidualCodec, TokenProbabilityBackend
+from src.codec import compress_fasta, decompress_ghdna
+from src.fasta import read_fasta
 
 
 class FakeDNABackend(TokenProbabilityBackend):
@@ -87,3 +89,27 @@ def test_dnagpt2_residual_codec_splits_long_sequence_into_safe_chunks() -> None:
     chunks = codec.split_sequence("ACGTNAC")
 
     assert chunks == ["ACGT", "NAC"]
+
+
+def test_dnagpt2_multi_chunk_round_trip_with_context_reuse(tmp_path) -> None:
+    source = tmp_path / "input.fa"
+    archive = tmp_path / "output.ghdna"
+    restored = tmp_path / "restored.fa"
+    sequence = "ACGT" * 43
+    source.write_text(f">sample\n{sequence}\n", encoding="utf-8")
+
+    codec = DNAGPT2ResidualCodec(FakeDNABackend(context_length=80), state_bits=32)
+    metadata = compress_fasta(
+        source,
+        archive,
+        k=100,
+        min_repeat_len=200,
+        archive_version=2,
+        residual_codec=codec,
+    )
+    decompress_ghdna(archive, restored, residual_codec=codec)
+
+    residuals = [block for block in metadata["blocks"] if block["type"] == "llm_residual"]
+    assert len(residuals) > 1
+    assert any(block.get("use_context") for block in residuals[1:])
+    assert read_fasta(restored) == read_fasta(source)
